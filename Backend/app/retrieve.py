@@ -52,10 +52,18 @@ def extract_date_from_question(question: str) -> str | None:
 def tokenize(s: str) -> list[str]:
     s = (s or "").lower()
     s = re.sub(r"[^a-z0-9/ ]+", " ", s)
-    return [t for t in s.split() if t and t not in STOP]
+    tokens = [t for t in s.split() if t and t not in STOP]
+    # Expand with stem/related forms so "discharged" matches "discharge", "admitted" matches "admission"
+    expanded = list(tokens)
+    for t in tokens:
+        if t == "discharged":
+            expanded.append("discharge")
+        elif t == "admitted":
+            expanded.extend(["admission", "admit", "admitted"])
+    return list(dict.fromkeys(expanded))
 
 
-BOOST_TERMS = ["signed", "discharge", "pacu", "criteria", "audit", "order", "electronically", "signature", "patient", "medication", "mg"]
+BOOST_TERMS = ["signed", "discharge", "discharged", "admission", "admitted", "pacu", "criteria", "audit", "order", "electronically", "signature", "patient", "medication", "mg"]
 
 
 def score_line(qtoks: list[str], line_text: str, question_date: str | None) -> float:
@@ -75,10 +83,12 @@ def score_line(qtoks: list[str], line_text: str, question_date: str | None) -> f
         boost += 2.0
     if "electronically" in lower and "signed" in lower:
         boost += 0.5
-    # Discharge/PACU
+    # Discharge/PACU/Admission
     if "pacu" in lower or "post-anaesthesia" in lower or "post anaesthesia" in lower:
         boost += 1.0
-    if "discharge" in lower:
+    if "discharge" in lower or "discharged" in lower:
+        boost += 1.0
+    if "admission" in lower or "admitted" in lower or "admit" in lower:
         boost += 1.0
     # Other clinical terms
     for term in BOOST_TERMS:

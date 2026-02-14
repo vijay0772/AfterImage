@@ -2,6 +2,8 @@
 """PDF Q&A with Line-ID grounded highlights."""
 
 import re
+from collections import defaultdict
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,6 +14,11 @@ from .storage import ensure_dirs, sha256_bytes, save_pdf, pdf_path, artifact_pat
 from .lines import build_lines_from_words
 from .retrieve import top_k_lines_with_context, extract_date_from_question
 from .llm import ask_llm
+from .flowsheet import (
+    build_flowsheet_sections_from_lines,
+    is_flowsheet_question,
+    get_flowsheet_answer,
+)
 import os
 
 SIGNED_INTENT_RE = re.compile(r"\b(signed|signature|who signed|signers?|discharge)\b", re.IGNORECASE)
@@ -21,6 +28,33 @@ SIGNER_RE = re.compile(
 )
 ORDERING_DOCTOR_RE = re.compile(r"Ordering Doctor:\s*([A-Za-z][A-Za-z.,\s\-]+?)(?:\s{2,}|\d|$)", re.IGNORECASE)
 
+ORDERING_DOCTOR_DATE_PROXIMITY = 10
+
+
+def _line_contains_question_date(ln: dict, question_date: str) -> bool:
+    """Check if line text contains the question date (04/06/24, 4/6/24, April 6, apr 6)."""
+    if not question_date:
+        return False
+    t = ln.get("text", "") or ""
+    if question_date in t:
+        return True
+    parts = question_date.split("/")
+    if len(parts) == 3:
+        if f"{int(parts[0])}/{int(parts[1])}/{parts[2]}" in t:
+            return True
+        month_abbrev = {"01": "jan", "02": "feb", "03": "mar", "04": "apr", "05": "may", "06": "jun",
+                        "07": "jul", "08": "aug", "09": "sep", "10": "oct", "11": "nov", "12": "dec"}
+        month_full = {"01": "january", "02": "february", "03": "march", "04": "april", "05": "may", "06": "june",
+                      "07": "july", "08": "august", "09": "september", "10": "october", "11": "november", "12": "december"}
+        if parts[0] in month_abbrev:
+            d = str(int(parts[1]))
+            tl = t.lower()
+            if f"{month_abbrev[parts[0]]} {d}" in tl or f"{month_abbrev[parts[0]]} {parts[1]}" in tl:
+                return True
+            if parts[0] in month_full and f"{month_full[parts[0]]} {d}" in tl:
+                return True
+    return False
+
 
 def _find_ordering_doctor_fallback(
     candidates: list[dict],
@@ -28,23 +62,37 @@ def _find_ordering_doctor_fallback(
     question_date: str | None,
 ) -> tuple[list[dict], list[str]]:
     """
-    When Signed lines are garbled, try clean 'Ordering Doctor: Name' lines from same pages as date hits.
-    Ordering Doctor lines often have better encoding than Signed lines.
+    When Signed lines are garbled, try clean 'Ordering Doctor: Name' lines.
+    Only include an Ordering Doctor if within ±N lines of a line containing the question date.
     """
+    if not question_date:
+        return [], []
     signers = []
     evidence_lines = []
     date_hit_pages = {ln["page"] for ln in candidates}
-    # Search all lines on those pages for Ordering Doctor
+    lines_by_page: dict[int, list[dict]] = defaultdict(list)
+    for ln in all_lines:
+        lines_by_page[ln["page"]].append(ln)
     for ln in all_lines:
         if ln["page"] not in date_hit_pages:
             continue
         t = ln.get("text", "")
         m = ORDERING_DOCTOR_RE.search(t)
-        if m:
-            name = m.group(1).strip().rstrip(".,")
-            if name and len(name) > 2 and name not in signers and not _is_garbled_name(name):
-                signers.append(name)
-                evidence_lines.append(ln)
+        if not m:
+            continue
+        page_lines = lines_by_page[ln["page"]]
+        idx = next((i for i, l in enumerate(page_lines) if l.get("line_id") == ln.get("line_id")), -1)
+        if idx < 0:
+            continue
+        start = max(0, idx - ORDERING_DOCTOR_DATE_PROXIMITY)
+        end = min(len(page_lines), idx + ORDERING_DOCTOR_DATE_PROXIMITY + 1)
+        has_date_nearby = any(_line_contains_question_date(page_lines[i], question_date) for i in range(start, end))
+        if not has_date_nearby:
+            continue
+        name = m.group(1).strip().rstrip(".,")
+        if name and len(name) > 2 and name not in signers and not _is_garbled_name(name):
+            signers.append(name)
+            evidence_lines.append(ln)
     return evidence_lines, signers
 
 
@@ -108,13 +156,14 @@ async def upload_document(file: UploadFile = File(...), force: bool = False):
         save_pdf(doc_id, b)
     if not os.path.exists(art_path) or force:
         line_data = build_lines_from_words(pdf_fp)
-        # Store lines + pages (lines_by_id/lines_by_page reconstructed on load)
+        flowsheet_sections = build_flowsheet_sections_from_lines(line_data["lines"])
         save_artifact(doc_id, {
             "doc_id": doc_id,
             "filename": file.filename,
             "page_count": line_data["page_count"],
             "pages": line_data["pages"],
             "lines": line_data["lines"],
+            "flowsheet_sections": flowsheet_sections,
         })
     art = load_artifact(doc_id)
     return UploadResponse(doc_id=doc_id, filename=art["filename"], page_count=art["page_count"])
@@ -215,12 +264,14 @@ def ask(doc_id: str, req: AskRequest):
     if not lines and art.get("chunks"):
         # Old artifact format - auto-rebuild with line-based extraction
         line_data = build_lines_from_words(fp)
+        flowsheet_sections = build_flowsheet_sections_from_lines(line_data["lines"])
         art = {
             "doc_id": doc_id,
             "filename": art.get("filename", ""),
             "page_count": line_data["page_count"],
             "pages": line_data["pages"],
             "lines": line_data["lines"],
+            "flowsheet_sections": flowsheet_sections,
         }
         save_artifact(doc_id, art)
         lines = line_data["lines"]
@@ -231,6 +282,22 @@ def ask(doc_id: str, req: AskRequest):
             highlights=[],
             page_dims={str(p["page"]): {"width": p["width"], "height": p["height"]} for p in art.get("pages", [])},
         )
+    # Flowsheet path: time + vitals question → direct section lookup (skip RAG)
+    flowsheet_sections = art.get("flowsheet_sections")
+    if not flowsheet_sections and lines:
+        flowsheet_sections = build_flowsheet_sections_from_lines(lines)
+    if flowsheet_sections and is_flowsheet_question(req.question):
+        answer_text, ev_lines = get_flowsheet_answer(req.question, flowsheet_sections)
+        if answer_text and ev_lines:
+            evidence_items = [EvidenceItem(page=ln["page"], line_id=ln.get("line_id", ""), text=ln.get("text", "")) for ln in ev_lines]
+            highlights_by_page: dict[int, list] = {}
+            for ln in ev_lines:
+                bbox = ln.get("bbox")
+                if bbox and len(bbox) >= 4:
+                    highlights_by_page.setdefault(ln["page"], []).append(bbox)
+            highlight_items = [HighlightItem(page=p, rects=rects) for p, rects in sorted(highlights_by_page.items())]
+            page_dims = {str(p["page"]): {"width": p["width"], "height": p["height"]} for p in art.get("pages", [])}
+            return AskResponse(answer=answer_text, evidence=evidence_items, highlights=highlight_items, page_dims=page_dims)
     # Line-based retrieval (date-filtered when question mentions date)
     candidates = top_k_lines_with_context(req.question, lines, k=20, context_lines=2)
     if not candidates:
